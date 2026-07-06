@@ -14,12 +14,16 @@ use esp_hal::{
     clock::CpuClock,                              // Pour régler la vitesse du processeur
     time::{Duration, Instant},                     // Pour gérer des délais/mesures de temps
     delay::Delay,                                   // Le "délai bloquant" fourni par esp-hal
-    gpio::{DriveMode, Flex, Level, OutputConfig, Pull} // Types pour configurer une broche GPIO
+    gpio::{DriveMode, Flex, Level, Output, OutputConfig, Pull} // Types pour configurer une broche GPIO
 };
 use esp_println::println; // Permet d'afficher du texte sur le port série (comme printf)
 
 // Crate qui sait parler au capteur de température DS18B20 via le protocole 1-Wire
 use ds18b20::Ds18b20;
+
+//DHT11
+// use dht11::Dht11;
+use embedded_dht_rs::dht11::Dht11;
 
 // Anciens traits (v0.2) d'embedded-hal, nécessaires car `one-wire-bus` ne connaît
 // pas encore les traits plus récents (v1.0) qu'utilise esp-hal.
@@ -109,31 +113,112 @@ fn main() -> ! {
 
     // Crée l'objet représentant CE capteur précis (identifié par son adresse).
     // Les opérations GPIO d'esp-hal ne peuvent pas échouer, d'où `Infallible`.
-    let ds18b20_0 = Ds18b20::new::<core::convert::Infallible>(address_1).expect("erreur");
+    let ds18b20_1 = Ds18b20::new::<core::convert::Infallible>(address_1).expect("erreur");
 
     // Scanne une fois le bus au démarrage pour lister les capteurs présents (debug/vérification).
     find_devices(&mut delay, &mut one_wire_bus);
 
+    // --- Seuils de température pour la couvaison des œufs de poule ---
+    // Zone de tolérance : entre TEMP_MIN et TEMP_MAX, aucun système n'est actionné.
+    let TEMP_MIN: f32 = 37.5;
+    let TEMP_MAX: f32 = 37.8;
+
+    // Les broches 2 zt 5 sont utilisées pour le controle du système de 
+    // refroidissement et de rechauffement 
+    let pin_de_refroidissement = peripherals.GPIO2;
+    let pin_de_rechauffement = peripherals.GPIO5;
+    let mut refroidissement = Output::new(pin_de_refroidissement, Level::High, OutputConfig::default());
+    let mut rechauffement = Output::new(pin_de_rechauffement, Level::High, OutputConfig::default());
+
+    // --- Configuration du DHT11 ---
+    // On utilise une config OutputConfig dédiée (dht11_config) plutôt que de réutiliser
+    // od_config (celle du 1-Wire) : ça permet de régler indépendamment le pull-up du DHT11
+    // si jamais on doit ajuster ce capteur sans toucher au réglage du DS18B20. 
+    let dht11_config = OutputConfig::default()
+        .with_drive_mode(DriveMode::OpenDrain)
+        .with_pull(Pull::Up); // Pull-up interne. Remplace par Pull::None si tu as une résistance externe de 4.7kΩ
+
+    let mut dht11_pin = Flex::new(peripherals.GPIO27);
+    dht11_pin.apply_output_config(&dht11_config); // Applique le mode open-drain
+    dht11_pin.set_input_enable(true);          // Active la lecture
+    dht11_pin.set_output_enable(true);    
+    dht11_pin.set_level(Level::High);           // Ligne au repos = état haut
+                                                
+    // Contrairement au DS18B20, le crate `embedded_dht_rs` attend directement les traits
+    // embedded-hal 1.0 (pas les traits v2 de 0.2.x) : pas besoin de `.reverse_cell()` ici.
+    // (Tentative laissée en commentaire pour mémoire : ça ne compilerait pas / n'est pas nécessaire.)
+    // let dht11_pin = dht11_pin.reverse_cell();
+    // let mut dht11 = Dht11::new(dht11_pin); // ancienne API sans delay (crate `dht11`, abandonnée)
+
+//    let dht11_pin = dht11_pin.reverse_cell();
+//    let mut dht11 = Dht11::new(dht11_pin);
+    let delay2 = Delay::new();
+    let mut dht11 = Dht11::new(dht11_pin, delay2);
+
+    
+
     loop {
         // 1. Demande au capteur de démarrer une mesure de température.
         //    (Ne bloque pas : le capteur mesure en tâche de fond.)
-        ds18b20_0
+        ds18b20_1
             .start_temp_measurement(&mut one_wire_bus, &mut delay)
             .unwrap();
 
         // 2. Lit le résultat de la mesure précédente.
-        let ds18b20_data = ds18b20_0.read_data(&mut one_wire_bus, &mut delay);
 
-        match ds18b20_data {
-            Ok(valeur) => println!("TEMP: {:?}", valeur.temperature), // Affiche la température lue
-            Err(_) => {} // En cas d'erreur de lecture, on ignore silencieusement (à améliorer si besoin)
+        let ds18b20_1_data = ds18b20_1.read_data(&mut one_wire_bus, &mut delay);
+
+        match ds18b20_1_data {
+            Ok(valeur) => {
+                // Trop froid : on coupe le refroidissement et on active le chauffage.
+                if valeur.temperature < TEMP_MIN {
+                    refroidissement.set_high(); // relais au repos (NC) = refroidissement OFF
+                    println!("TEMP= {}°C. Déactivation du système de refroidissement", valeur.temperature); 
+                    rechauffement.set_low();    // relais activé (NO) = chauffage ON
+                    println!("TEMP= {}°C. Activation du système de rechauffement", valeur.temperature); 
+                }                
+
+                // Trop chaud : on coupe le chauffage et on active le refroidissement.
+                if valeur.temperature > TEMP_MAX {
+                    rechauffement.set_high();   // relais au repos (NC) = chauffage OFF
+                    println!("TEMP= {}°C. Déactivation du système de rechauffement", valeur.temperature); 
+                    refroidissement.set_low();  // relais activé (NO) = refroidissement ON
+                    println!("TEMP= {}°C. Activation du système de refroidissement", valeur.temperature); 
+                }
+
+                // Dans la plage idéale : les deux systèmes restent au repos.
+                if valeur.temperature < TEMP_MAX && valeur.temperature > TEMP_MIN {
+                    rechauffement.set_high();
+                    refroidissement.set_high();
+                }
+            }
+            Err(_) => {}
         }
 
-        // Petite pause de 750ms avant le prochain cycle mesure/lecture.
+        // Tentative précédente avec une autre méthode du driver (perform_measurement),
+        // remplacée par .read() qui est l'API actuelle du crate embedded_dht_rs.
+        // match dht11.perform_measurement(&mut delay) {
+        //     Ok(meas) => println!("Temp: {} Hum: {}", meas.temperature, meas.humidity),
+        //     Err(e) => println!("Error: {:?}", e),
+        // };
+        match dht11.read() {
+            Ok(sensor_reading) => println!(
+                "DHT 11 Sensor - Temperature: {} °C, humidity: {} %",
+                sensor_reading.temperature,
+                sensor_reading.humidity
+            ),
+            Err(error) => println!("An error occurred while trying to read sensor: {:?}", error),
+        }
+
         let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(750) {}
+        while delay_start.elapsed() < Duration::from_millis(1750) {}
     }
 }        
 //    ⚠️ Attention : le capteur a besoin d'un certain temps pour terminer
 //    sa mesure (jusqu'à 750ms en résolution 12 bits) avant que la lecture
 //    soit fiable — voir la remarque plus bas.
+
+//    ⚠️ Attention : le relais utilisé pour commnadé le système de refroidissement ou de
+//    rechauffement est le "JQC3F-05VDC-C". Il est commandé pour un signal baw(low)
+//    INPUT=0 ---> Basculement de NC(Normaly Close) à NO(Normaly Open)
+//    INPUT=1 ---> Basculement de NO(Normaly Open) à NC(Normaly Close)

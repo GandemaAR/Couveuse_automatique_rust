@@ -6,7 +6,9 @@ version = 4
 name = "OneWire_on_ESP32"
 version = "0.1.0"
 dependencies = [
+ "dht11",
  "ds18b20",
+ "embedded-dht-rs",
  "embedded-hal 0.2.7",
  "embedded-hal-compat",
  "esp-bootloader-esp-idf",
@@ -216,6 +218,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dht11"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa82acd8985622297d3feb1e2bf1ce177aaa1d6518df69524110410d08c7fb06"
+dependencies = [
+ "embedded-hal 0.2.7",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -325,6 +336,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9d2e857f87ac832df68fa498d18ddc679175cf3d2e4aa893988e5601baf9438"
 dependencies = [
  "nb 1.1.0",
+]
+
+[[package]]
+name = "embedded-dht-rs"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d29effeefb22e6d214e9ab294123ff3fe3578159679cde5591c82c272c8ae53f"
+dependencies = [
+ "embedded-hal 1.0.0",
 ]
 
 [[package]]
