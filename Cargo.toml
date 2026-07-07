@@ -17,9 +17,19 @@ ds18b20 = "=0.1.1"
 one-wire-bus = "0.1.1"
 embedded-hal = "0.2.3"
 embedded-hal-compat = "0.13.0"   # bridges esp-hal's eh 1.0 pin to eh 0.2's v2 traits
-esp-println = { version = "0.17.0", features = ["esp32", "auto"] }
+esp-println = { version = "0.13.0", features = ["esp32", "auto"] }
 dht11 = "0.3.1"
 embedded-dht-rs = { version = "0.5.0", features = ["dht11"] }
+# OLED 
+ssd1306 = { version = "0.10.0", features = ["async"] }
+embedded-graphics = "0.8.1"
+esp-rtos = { version = "0.3.0", features = ["embassy", "esp32"] }
+embassy-executor = { version = "0.10.0", features = ["nightly"] }
+embassy-time = "0.5.1"
+heapless = "0.9.3"
+profont = "0.7.0"
+
+
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

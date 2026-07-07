@@ -1,6 +1,6 @@
 #![no_std]  // Pas de bibliothèque standard : on tourne sur un micro-contrôleur (pas d'OS)
 #![no_main] // Pas de fonction `main()` classique, on utilise celle fournie par esp-hal via #[main]
-
+#![feature(impl_trait_in_assoc_type)]
 // Ces deux lignes interdisent certaines pratiques dangereuses en embarqué :
 #![deny(
     clippy::mem_forget,
@@ -10,17 +10,18 @@
 #![deny(clippy::large_stack_frames)] // Empêche les frames de pile trop grosses (mémoire limitée)
 
 use esp_hal::{
-    main,
     clock::CpuClock,                              // Pour régler la vitesse du processeur
-    time::{Duration, Instant},                     // Pour gérer des délais/mesures de temps
+    time::{Instant, Rate},                     // Pour gérer des délais/mesures de temps
+    timer::timg::TimerGroup, 
     delay::Delay,                                   // Le "délai bloquant" fourni par esp-hal
-    gpio::{DriveMode, Flex, Level, Output, OutputConfig, Pull} // Types pour configurer une broche GPIO
+    gpio::{DriveMode, Flex, Level, Output, OutputConfig, Pull}, // Types pour configurer une broche GPIO
+    i2c::master::{I2c, Config as I2cConfig}
 };
+use esp_rtos::main;
+use embassy_time::{Duration, Timer};
 use esp_println::println; // Permet d'afficher du texte sur le port série (comme printf)
-
 // Crate qui sait parler au capteur de température DS18B20 via le protocole 1-Wire
 use ds18b20::Ds18b20;
-
 //DHT11
 // use dht11::Dht11;
 use embedded_dht_rs::dht11::Dht11;
@@ -37,13 +38,34 @@ use embedded_hal::{
 use embedded_hal_compat::ReverseCompat;
 
 use one_wire_bus::{Address, OneWire}; // Le bus 1-Wire lui-même + le type d'adresse d'un capteur
-use core::fmt::Debug;
+use core::fmt::{Debug, Write};
+use heapless::String;
+
+// OLED
+use ssd1306::{I2CDisplayInterface, Ssd1306Async, prelude::*};
+
+// Embedded Graphics
+use embedded_graphics::{
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10, MonoTextStyle},
+    pixelcolor::BinaryColor,
+    prelude::Point,
+    prelude::*,
+    primitives::{
+        Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment, Triangle,
+    },
+    text::{Alignment, Baseline, Text},
+    mock_display::MockDisplay,
+};
+use profont::{PROFONT_7_POINT,PROFONT_9_POINT,};
+
 
 // En cas de panique (erreur fatale), on boucle à l'infini au lieu de planter :
 // c'est la version la plus simple d'un panic handler pour l'embarqué.
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+    loop {
+        println!("Error");
+    }
 }
 
 // Génère les métadonnées d'application requises par le bootloader ESP-IDF
@@ -73,13 +95,21 @@ where
     clippy::large_stack_frames,
     reason = "il est normal d'allouer des buffers plus gros dans main"
 )]
-#[main]
-fn main() -> ! {
+
+
+#[esp_rtos::main]
+async fn main(spawner: embassy_executor::Spawner) {
     // --- Initialisation générale du chip ---
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max()); // CPU à vitesse max
     let peripherals = esp_hal::init(config); // Récupère l'accès à tous les périphériques (GPIO, etc.)
 
-    // Le delay d'esp-hal parle "embedded-hal 1.0" ; .reverse() le fait parler "0.2"
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+
+    use esp_hal::interrupt::software::SoftwareInterruptControl;
+    let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, software_interrupt.software_interrupt0);
+
+    let _ = spawner;    // Le delay d'esp-hal parle "embedded-hal 1.0" ; .reverse() le fait parler "0.2"
     // pour qu'il soit compatible avec ce qu'attend one-wire-bus / ds18b20.
     let mut delay = Delay::new().reverse();
 
@@ -155,9 +185,46 @@ fn main() -> ! {
     let delay2 = Delay::new();
     let mut dht11 = Dht11::new(dht11_pin, delay2);
 
+
+    //OLED 
+    let i2c_bus = I2c::new(
+        peripherals.I2C0,
+        // I2cConfig is alias of esp_hal::i2c::master::I2c::Config
+        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+    )
+    .unwrap()
+    .with_scl(peripherals.GPIO18)
+    .with_sda(peripherals.GPIO23)
+    .into_async();
+
+    let interface = I2CDisplayInterface::new(i2c_bus);
+    // initialize the display
+    let mut display = Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
+    display.init().await.unwrap();
+
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&PROFONT_9_POINT)
+        .text_color(BinaryColor::On)
+        .build();
+
+
+    Text::with_baseline("Initialisation ...", Point::new(10, 30), text_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
     
+    display.flush().await.unwrap();
+    Timer::after(Duration::from_secs(3)).await;
+     let _ = display.clear(BinaryColor::Off);
+    
+    let _ = display.flush().await.unwrap();
 
     loop {
+        let _ = display.clear(BinaryColor::Off);
+        println!("test");
+        Text::new("   Couveuse   ", Point::new(20, 16), text_style)
+                   .draw(&mut display)
+                   .unwrap();
         // 1. Demande au capteur de démarrer une mesure de température.
         //    (Ne bloque pas : le capteur mesure en tâche de fond.)
         ds18b20_1
@@ -170,20 +237,27 @@ fn main() -> ! {
 
         match ds18b20_1_data {
             Ok(valeur) => {
-                // Trop froid : on coupe le refroidissement et on active le chauffage.
+                let mut mes: String<32> = String::new();
+                let _ = write!(mes, "Temp: {:.2}°C",valeur.temperature);
+                let result: &str = mes.as_str();
+                Text::new(result, Point::new(20, 36), text_style)
+                   .draw(&mut display)
+                   .unwrap();
+
+                 // Trop froid : on coupe le refroidissement et on active le chauffage.
                 if valeur.temperature < TEMP_MIN {
                     refroidissement.set_high(); // relais au repos (NC) = refroidissement OFF
-                    println!("TEMP= {}°C. Déactivation du système de refroidissement", valeur.temperature); 
+                    //println!("TEMP= {}°C. Déactivation du système de refroidissement", valeur.temperature); 
                     rechauffement.set_low();    // relais activé (NO) = chauffage ON
-                    println!("TEMP= {}°C. Activation du système de rechauffement", valeur.temperature); 
+                    //println!("TEMP= {}°C. Activation du système de rechauffement", valeur.temperature); 
                 }                
 
                 // Trop chaud : on coupe le chauffage et on active le refroidissement.
                 if valeur.temperature > TEMP_MAX {
                     rechauffement.set_high();   // relais au repos (NC) = chauffage OFF
-                    println!("TEMP= {}°C. Déactivation du système de rechauffement", valeur.temperature); 
+                    //println!("TEMP= {}°C. Déactivation du système de rechauffement", valeur.temperature); 
                     refroidissement.set_low();  // relais activé (NO) = refroidissement ON
-                    println!("TEMP= {}°C. Activation du système de refroidissement", valeur.temperature); 
+                    //println!("TEMP= {}°C. Activation du système de refroidissement", valeur.temperature); 
                 }
 
                 // Dans la plage idéale : les deux systèmes restent au repos.
@@ -192,7 +266,11 @@ fn main() -> ! {
                     refroidissement.set_high();
                 }
             }
-            Err(_) => {}
+            Err(_) => {
+                Text::new("Error", Point::new(20, 36), text_style)
+                   .draw(&mut display)
+                   .unwrap();
+            }
         }
 
         // Tentative précédente avec une autre méthode du driver (perform_measurement),
@@ -202,16 +280,25 @@ fn main() -> ! {
         //     Err(e) => println!("Error: {:?}", e),
         // };
         match dht11.read() {
-            Ok(sensor_reading) => println!(
-                "DHT 11 Sensor - Temperature: {} °C, humidity: {} %",
-                sensor_reading.temperature,
-                sensor_reading.humidity
-            ),
-            Err(error) => println!("An error occurred while trying to read sensor: {:?}", error),
+            Ok(sensor_reading) => {
+                //println!("DHT 11 Sensor - Temperature: {} °C, humidity: {} %",sensor_reading.temperature,sensor_reading.humidity);
+                let mut mes: String<32> = String::new();
+                let _ = write!(mes, "Humidité: {}%",sensor_reading.humidity);
+                let result: &str = mes.as_str();                
+                Text::with_baseline(result, Point::new(20, 40), text_style, Baseline::Top)
+                   .draw(&mut display)
+                   .unwrap();
+            }
+            Err(error) => {
+                Text::new("Error", Point::new(20, 40), text_style)
+                   .draw(&mut display)
+                   .unwrap();
+                //println!("An error occurred while trying to read sensor: {:?}", error),
+            }
         }
-
-        let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(1750) {}
+        display.flush().await.unwrap();
+        Timer::after(Duration::from_secs(2)).await;
+        let _ = display.clear(BinaryColor::Off);
     }
 }        
 //    ⚠️ Attention : le capteur a besoin d'un certain temps pour terminer
@@ -222,3 +309,6 @@ fn main() -> ! {
 //    rechauffement est le "JQC3F-05VDC-C". Il est commandé pour un signal baw(low)
 //    INPUT=0 ---> Basculement de NC(Normaly Close) à NO(Normaly Open)
 //    INPUT=1 ---> Basculement de NO(Normaly Open) à NC(Normaly Close)
+
+
+//    Schema de montage wokwi : https://wokwi.com/projects/468817331616684033
